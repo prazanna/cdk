@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericArray;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.generic.IndexedRecord;
@@ -472,6 +473,34 @@ public class ManagedDaoTest {
     compareEntitiesWithUtf8(2, entity2After);
     assertEquals(2, entity2After.get("fieldToAdd1"));
     assertEquals(2, entity2After.get("fieldToAdd2"));
+  }
+
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testLatestSchemaCanReadOldRecords() throws Exception {
+    SchemaManager manager = new DefaultSchemaManager(tablePool);
+    Dao<GenericRecord, GenericRecord> dao = new GenericAvroDao(tablePool,
+        tableName, "TestRecord", manager);
+
+    manager.migrateSchema(tableName, "TestRecord", goodMigrationRecordAddField);
+
+    SchemaManager afterManager = new DefaultSchemaManager(tablePool);
+    Dao<GenericRecord, GenericRecord> afterDao = new GenericAvroDao(tablePool,
+        tableName, "TestRecord", afterManager);
+
+    // Create an entity with old dao.
+    GenericRecord key1 = createGenericKey(1);
+    GenericRecord entity1 = createGenericEntity(1, testRecordv2);
+    dao.put(key1, entity1);
+
+    // Get it with the new dao
+    GenericRecord entity1After = afterDao.get(key1);
+    compareEntitiesWithUtf8(1, entity1After);
+    GenericArray array = (GenericArray) entity1After.get("field5");
+    assertNotNull(array);
+    GenericRecord subRecord = (GenericRecord) array.get(0);
+    // New subfield is read as default value
+    assertEquals(new Utf8("subfield4"), subRecord.get("subfield4"));
   }
 
   @Test
