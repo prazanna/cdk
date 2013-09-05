@@ -29,7 +29,6 @@ import com.cloudera.cdk.morphline.base.AbstractCommand;
 import com.cloudera.cdk.morphline.base.Validator;
 import com.cloudera.cdk.morphline.shaded.com.google.code.regexp.GroupInfo;
 import com.cloudera.cdk.morphline.shaded.com.google.code.regexp.Matcher;
-import com.cloudera.cdk.morphline.shaded.com.google.code.regexp.Pattern;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 
@@ -63,15 +62,14 @@ public final class GrokBuilder implements CommandBuilder {
   ///////////////////////////////////////////////////////////////////////////////
   private static final class Grok extends AbstractCommand {
 
-    private final Map<String, Pattern> regexes = new HashMap();
+    private final Map<String, Matcher> regexes = new HashMap();
     private final boolean extract;
     private final boolean extractInPlace;
     private final NumRequiredMatches numRequiredMatches;
     private final boolean findSubstrings;
     private final boolean addEmptyStrings;
+    private final String firstKey; // cached value
 
-    private static final boolean ENABLE_FAST_EXTRACTION_PATH = true;
-    
     public Grok(Config config, Command parent, Command child, MorphlineContext context) {
       super(config, parent, child, context);
       
@@ -79,8 +77,9 @@ public final class GrokBuilder implements CommandBuilder {
       Config exprConfig = getConfigs().getConfig(config, "expressions", ConfigFactory.empty());
       for (Map.Entry<String, Object> entry : exprConfig.root().unwrapped().entrySet()) {
         String expr = entry.getValue().toString();
-        this.regexes.put(entry.getKey(), dict.compileExpression(expr));
+        this.regexes.put(entry.getKey(), dict.compileExpression(expr).matcher(""));
       }
+      this.firstKey = (regexes.size() == 0 ? null : regexes.entrySet().iterator().next().getKey());
 
       String extractStr = getConfigs().getString(config, "extract", "true");
       this.extractInPlace = extractStr.equals("inplace");
@@ -107,13 +106,26 @@ public final class GrokBuilder implements CommandBuilder {
         // Ensure that we mutate the record inplace only if *all* expressions match.
         // To ensure this we potentially run doMatch() twice: the first time to check, the second
         // time to mutate
-        if (regexes.size() > 1 || numRequiredMatches != NumRequiredMatches.atLeastOnce) {
+        boolean isFast;
+        if (regexes.size() == 0) {
+          isFast = true;
+        } else if (regexes.size() > 1) {
+          isFast = false;
+        } else if (numRequiredMatches == NumRequiredMatches.atLeastOnce) {
+          isFast = true;
+        } else { // all or once
+          assert regexes.size() == 1;
+          assert firstKey != null;
+          isFast = (inputRecord.get(firstKey).size() <= 1);
+        }
+        
+        if (!isFast) {
           if (!doMatch(inputRecord, outputRecord, false)) {
             return false;
           }
         } else {
           ; // no need to do anything
-          // This is a performance enhancement for "atLeastOnce" case with a single expression:
+          // This is a performance enhancement for some cases with a single expression:
           // By the time we find a regex match we know that the whole command will succeed,
           // so there's really no need to run doMatch() twice.
         }
@@ -121,12 +133,14 @@ public final class GrokBuilder implements CommandBuilder {
       if (!doMatch(inputRecord, outputRecord, extract)) {
         return false;
       }
+      
+      // pass record to next command in chain:
       return super.doProcess(outputRecord);
     }
 
     private boolean doMatch(Record inputRecord, Record outputRecord, boolean doExtract) {
-      for (Map.Entry<String, Pattern> regexEntry : regexes.entrySet()) {
-        Pattern pattern = regexEntry.getValue();
+      for (Map.Entry<String, Matcher> regexEntry : regexes.entrySet()) {
+        Matcher matcher = regexEntry.getValue();
         List values = inputRecord.get(regexEntry.getKey());
         int todo = values.size();
         int minMatches = 1;
@@ -145,21 +159,15 @@ public final class GrokBuilder implements CommandBuilder {
           }
         }        
         int numMatches = 0;
-        Matcher matcher = null;
         for (Object value : values) {
-          String strValue = value.toString();
-          if (matcher == null) {
-            matcher = pattern.matcher(strValue); // TODO cache that object more permanently (perf)?
-          } else {
-            matcher.reset(strValue);
-          }
+          matcher.reset(value.toString());
           if (!findSubstrings) {
             if (matcher.matches()) {
               numMatches++;
               if (numMatches > maxMatches) {
                 return false;
               }
-              extract(outputRecord, pattern, matcher, doExtract);
+              extract(outputRecord, matcher, doExtract);
             }
           } else {
             int previousNumMatches = numMatches;
@@ -173,7 +181,7 @@ public final class GrokBuilder implements CommandBuilder {
                   break; // fast path
                 }
               }
-              extract(outputRecord, pattern, matcher, doExtract);
+              extract(outputRecord, matcher, doExtract);
             }
           }
           todo--;
@@ -188,18 +196,14 @@ public final class GrokBuilder implements CommandBuilder {
       return true;
     }
 
-    private void extract(Record outputRecord, Pattern pattern, Matcher matcher, boolean doExtract) {
+    private void extract(Record outputRecord, Matcher matcher, boolean doExtract) {
       if (doExtract) {
-        if (ENABLE_FAST_EXTRACTION_PATH) {
-          extractFast(outputRecord, pattern, matcher);
-        } else {
-          extractSlow(outputRecord, pattern, matcher); // same semantics but less efficient
-        }
+        extractFast(outputRecord, matcher);
       }
     }
 
-    private void extractFast(Record outputRecord, Pattern pattern, Matcher matcher) {
-      for (Map.Entry<String, List<GroupInfo>> entry : pattern.groupInfo().entrySet()) {
+    private void extractFast(Record outputRecord, Matcher matcher) {
+      for (Map.Entry<String, List<GroupInfo>> entry : matcher.namedPattern().groupInfo().entrySet()) {
         String groupName = entry.getKey();
         List<GroupInfo> list = entry.getValue();
         int idx = list.get(0).groupIndex();
@@ -211,15 +215,6 @@ public final class GrokBuilder implements CommandBuilder {
       }
     }
 
-    private void extractSlow(Record outputRecord, Pattern pattern, Matcher matcher) {
-      for (String groupName : pattern.groupNames()) {
-        String value = matcher.group(groupName);
-        if (value != null && (value.length() > 0 || addEmptyStrings)) {
-          outputRecord.put(groupName, value);
-        }
-      }
-    }
-    
     
     ///////////////////////////////////////////////////////////////////////////////
     // Nested classes:
